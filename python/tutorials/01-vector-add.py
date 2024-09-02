@@ -19,7 +19,7 @@ In doing so, you will learn about:
 # --------------
 
 import torch
-
+import time
 import triton
 import triton.language as tl
 
@@ -32,21 +32,44 @@ def add_kernel(x_ptr,  # *Pointer* to first input vector.
                BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
                # NOTE: `constexpr` so it can be used as a shape value.
                ):
+    # You can think of what's happening inside a @triton.jit'd function as the "local view" of a single block.
+    # Multiple blocks will be processed in parallel.
+    
     # There are multiple 'programs' processing different data. We identify which program
     # we are here:
     pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
     # This program will process inputs that are offset from the initial data.
     # For instance, if you had a vector of length 256 and block_size of 64, the programs
     # would each access the elements [0:64, 64:128, 128:192, 192:256].
-    # Note that offsets is a list of pointers:
+
+    # block_start is just a scalar which is the starting index for the lbock's portion of the input data
+    # It tells the block wehre to begin its operations within the larger dataset.
     block_start = pid * BLOCK_SIZE
+
+    # Note: We use tl.arange instead of Python's range because the latter generates values on
+    # the CPU, not the GPU and incompatible with how GPU threads are supposed to work. The former generates
+    # ranges directly on the GPU.
+
+    # Note that offsets is a list of pointers: 
+    # This generates logical indices to read from the input tensors.
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
     # Create a mask to guard memory operations against out-of-bounds accesses.
     mask = offsets < n_elements
     # Load x and y from DRAM, masking out any extra elements in case the input is not a
     # multiple of the block size.
+    # Triton automatically handles scaling by the element size when using pointer arithmetic with tensors.
+    # For indices where mask is false, don't load data at the address pointer
+    # Each x and y value is loaded from DRAM into a register, which is the fastest form of memory on a GPU
+    # and private to each thread, ensuring
+    # that each thread can perform its computations without interfering with other threads.
+    # For an A100 GPU, there are max 255 registers/thread.
+    # Warps (groups of 32 threads) execute these instructions at the same time, with different data,
+    # and Triton ensures each warp is accessing adjacent memory locations (e.g. memory accesses are coalesced).
+    # This means fewer memory transactions and improved performance.
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
+    # Perform the computation. This is performed by each thread independently.
     output = x + y
     # Write x + y back to DRAM.
     tl.store(output_ptr + offsets, output, mask=mask)
@@ -67,7 +90,7 @@ def add(x: torch.Tensor, y: torch.Tensor):
     # In this case, we use a 1D grid where the size is the number of blocks:
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
     # NOTE:
-    #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
+    #  - Each torch.tensor object is implicitly converted into a pointer to its first element. These are pointers to arrays in global memory (GPU's DRAM)
     #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
     #  - Don't forget to pass meta-parameters as keywords arguments.
     add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
@@ -80,13 +103,38 @@ def add(x: torch.Tensor, y: torch.Tensor):
 # We can now use the above function to compute the element-wise sum of two `torch.tensor` objects and test its correctness:
 
 torch.manual_seed(0)
-size = 98432
+# size = 98432
+size = 2**30
+# Make sure the tensors are moved to the GPU.
 x = torch.rand(size, device='cuda')
 y = torch.rand(size, device='cuda')
+start_time_torch = time.time()
 output_torch = x + y
-output_triton = add(x, y)
+end_time_torch = time.time()
 print(output_torch)
+print("Torch time:", end_time_torch - start_time_torch)
+
+# Note that the first time you run this, the Triton kernel is compiled from Triton source code into PTX code,
+# and thus will take longer than the torch execution
+start_time_triton = time.time()
+
+output_triton = add(x, y)
+
+# In Pytorch, when you print a GPU tensor directly, it will implicitly transfer the tensor to the
+# CPU to display its values. Using print(output_triton) also implicitly synchronizes the CPU
+# and GPU, waiting for all GPU operations to complete.
 print(output_triton)
+end_time_triton = time.time()
+print("Triton first time:", end_time_triton - start_time_triton)
+print(f'The maximum difference between torch and triton is '
+      f'{torch.max(torch.abs(output_torch - output_triton))}')
+
+# The second time you run this will be much faster, as it is using the cached compiled kernel
+start_time_triton = time.time()
+output_triton = add(x, y)
+print(output_triton)
+end_time_triton = time.time()
+print("Triton second time:", end_time_triton - start_time_triton)
 print(f'The maximum difference between torch and triton is '
       f'{torch.max(torch.abs(output_torch - output_triton))}')
 
@@ -123,6 +171,7 @@ def benchmark(size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: x + y, quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y), quantiles=quantiles)
+    # The factor of 3 is for reading from x, reading from y, and writing to z.
     gbps = lambda ms: 3 * x.numel() * x.element_size() / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
@@ -130,4 +179,6 @@ def benchmark(size, provider):
 # %%
 # We can now run the decorated function above. Pass `print_data=True` to see the performance number, `show_plots=True` to plot them, and/or
 # `save_path='/path/to/results/' to save them to disk along with raw CSV data:
+
+# Note that this is plotting the gbps (inverse of time), so higher is better
 benchmark.run(print_data=True, show_plots=True)
